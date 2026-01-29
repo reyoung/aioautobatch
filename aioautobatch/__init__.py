@@ -1,0 +1,150 @@
+import typing
+import dataclasses
+import asyncio
+
+__all__ = ["autobatch"]
+
+P = typing.ParamSpec("P")
+R = typing.TypeVar("R")
+
+
+class Fn(typing.Protocol[P, R]):
+    async def __call__(self, *args: P.args) -> asyncio.Future[R]: ...
+
+
+ArgsTuple = tuple[typing.Unpack[P.args]]
+
+
+class BatchFn(typing.Protocol[P, R]):
+    async def __call__(self, args_list: list[ArgsTuple]) -> list[R]: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class _Job:
+    args: ArgsTuple
+    future: asyncio.Future[R]
+    created_at: float = dataclasses.field(
+        default_factory=lambda: asyncio.get_running_loop().time()
+    )
+
+
+class _AutoBatcher:
+    def __init__(
+        self,
+        batch_fn: BatchFn,
+        start_delay: float,
+        batch_size: int | None = None,
+        max_delay: float = 1.0,
+        max_concurrent_batches: int | None = None,
+        on_exception: typing.Callable[[Exception], None] | None = None,
+    ) -> None:
+        self._loop_task: None | asyncio.Task[None] = None
+        self._batch_fn = batch_fn
+        self._start_delay = start_delay
+        self._batch_size = batch_size
+        self._max_delay = max_delay
+        self._batch_semaphore: asyncio.Semaphore | None = None
+        if max_concurrent_batches is not None:
+            self._batch_semaphore = asyncio.Semaphore(max_concurrent_batches)
+        self._job_queue: asyncio.Queue[_Job] = asyncio.Queue()
+        self._on_exception = on_exception
+
+    async def __call__(self, *args: P.args) -> asyncio.Future[R]:
+        job = _Job(args=args, future=asyncio.get_running_loop().create_future())
+        await self._job_queue.put(job)
+
+        if self._loop_task is None:
+            self._loop_task = asyncio.create_task(self._loop())
+
+        return job.future
+
+    async def _loop(self) -> None:
+        try:
+            await self._loop_main()
+        finally:
+            self._loop_task = None
+
+    async def _loop_main(self) -> None:
+        first = True
+        while True:
+            if self._job_queue.empty():
+                # No jobs, wait for one
+                return
+
+            jobs = []
+            first_job = await self._job_queue.get()
+            jobs.append(first_job)
+            delay = self._start_delay if first else self._max_delay
+            first = False
+            await self._fetch_batch(jobs, delay)
+            await self._process_batch(jobs)
+
+    async def _process_batch(self, jobs: list[_Job]) -> None:
+        if self._batch_semaphore is not None:
+            await self._batch_semaphore.acquire()
+
+        task = asyncio.create_task(self._execute_batch(jobs))
+        task.add_done_callback(self._on_batch_done)
+
+    async def _execute_batch(self, jobs: list[_Job]) -> None:
+        args_list = []
+        futs = []
+        for job in jobs:
+            if job.future.cancelled():
+                continue
+            args_list.append(job.args)
+            futs.append(job.future)
+        try:
+            res_list = await self._batch_fn(args_list)
+        except Exception as e:
+            for fut in futs:
+                if not fut.cancelled():
+                    fut.set_exception(e)
+            raise
+        else:
+            for fut, res in zip(futs, res_list):
+                if not fut.cancelled():
+                    fut.set_result(res)
+
+    def _on_batch_done(self, task: asyncio.Task[None]) -> None:
+        if self._batch_semaphore is not None:
+            self._batch_semaphore.release()
+
+        exc = task.exception()
+        if exc is not None and self._on_exception is not None:
+            self._on_exception(exc)
+
+    async def _fetch_batch(self, jobs: list[_Job], delay: float) -> None:
+        begin = jobs[0].created_at
+
+        while self._batch_size is None or len(jobs) < self._batch_size:
+            now = asyncio.get_running_loop().time()
+            elapsed = now - begin
+            to_wait = delay - elapsed
+            if to_wait <= 0:
+                break
+
+            try:
+                job = await asyncio.wait_for(self._job_queue.get(), timeout=to_wait)
+            except asyncio.TimeoutError:
+                break
+
+            jobs.append(job)
+
+
+def autobatch(
+    batch_fn: BatchFn,
+    start_delay: float = 0,
+    batch_size: int | None = None,
+    max_delay: float = 1.0,
+    max_concurrent_batches: int | None = None,
+    on_exception: typing.Callable[[Exception], None] | None = None,
+) -> Fn:
+    return _AutoBatcher(
+        batch_fn,
+        start_delay=start_delay,
+        batch_size=batch_size,
+        max_delay=max_delay,
+        max_concurrent_batches=max_concurrent_batches,
+        on_exception=on_exception,
+    )
