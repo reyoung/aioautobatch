@@ -35,7 +35,7 @@ class _AutoBatcher(typing.Generic[*Ts, R]):
         batch_size: int | None = None,
         max_delay: float = 1.0,
         max_concurrent_batches: int | None = None,
-        on_exception: typing.Callable[[Exception], None] | None = None,
+        on_exception: typing.Callable[[BaseException], None] | None = None,
     ) -> None:
         self._loop_task: None | asyncio.Task[None] = None
         self._batch_fn: BatchFn[*Ts, R] = batch_fn
@@ -110,7 +110,12 @@ class _AutoBatcher(typing.Generic[*Ts, R]):
     def _on_batch_done(self, task: asyncio.Task[None]) -> None:
         if self._batch_semaphore is not None:
             self._batch_semaphore.release()
-
+        
+        if task.cancelled() and self._on_exception is not None:
+            # cancelled tasks do not have exceptions, so we create a generic one
+            self._on_exception(asyncio.CancelledError())
+            return
+        
         exc = task.exception()
         if exc is not None and self._on_exception is not None:
             self._on_exception(exc)
