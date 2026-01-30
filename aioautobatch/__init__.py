@@ -20,7 +20,7 @@ BatchFn: typing.TypeAlias = (
     ]
     | typing.Callable[
         [list[tuple[typing.Unpack[Ts]]], list[asyncio.Future[R]]],
-        typing.Awaitable[list[R] | None],
+        typing.Awaitable[None],
     ]
 )
 
@@ -105,7 +105,8 @@ class _AutoBatcher(typing.Generic[*Ts, R]):
             futs.append(job.future)
         try:
             if self._accepts_future_list:
-                res_list = await self._batch_fn(args_list, futs)
+                res_list = None
+                await self._batch_fn(args_list, futs)
             else:
                 res_list = await self._batch_fn(args_list)
         except Exception as e:
