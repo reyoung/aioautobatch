@@ -4,34 +4,33 @@ import asyncio
 
 __all__ = ["autobatch"]
 
-P = typing.ParamSpec("P")
+Ts = typing.TypeVarTuple("Ts")
 R = typing.TypeVar("R")
 
 
-class Fn(typing.Protocol[P, R]):
-    async def __call__(self, *args: P.args) -> asyncio.Future[R]: ...
+class Fn(typing.Protocol[*Ts, R]):
+    async def __call__(self, *args: typing.Unpack[Ts]) -> asyncio.Future[R]: ...
 
 
-ArgsTuple = tuple[typing.Unpack[P.args]]
-
-
-class BatchFn(typing.Protocol[P, R]):
-    async def __call__(self, args_list: list[ArgsTuple]) -> list[R]: ...
+class BatchFn(typing.Protocol[*Ts, R]):
+    async def __call__(
+        self, args_list: list[tuple[typing.Unpack[Ts]]]
+    ) -> list[R]: ...
 
 
 @dataclasses.dataclass(frozen=True)
-class _Job:
-    args: ArgsTuple
+class _Job(typing.Generic[*Ts, R]):
+    args: tuple[typing.Unpack[Ts]]
     future: asyncio.Future[R]
     created_at: float = dataclasses.field(
         default_factory=lambda: asyncio.get_running_loop().time()
     )
 
 
-class _AutoBatcher:
+class _AutoBatcher(typing.Generic[*Ts, R]):
     def __init__(
         self,
-        batch_fn: BatchFn,
+        batch_fn: BatchFn[*Ts, R],
         start_delay: float,
         batch_size: int | None = None,
         max_delay: float = 1.0,
@@ -39,18 +38,20 @@ class _AutoBatcher:
         on_exception: typing.Callable[[Exception], None] | None = None,
     ) -> None:
         self._loop_task: None | asyncio.Task[None] = None
-        self._batch_fn = batch_fn
+        self._batch_fn: BatchFn[*Ts, R] = batch_fn
         self._start_delay = start_delay
         self._batch_size = batch_size
         self._max_delay = max_delay
         self._batch_semaphore: asyncio.Semaphore | None = None
         if max_concurrent_batches is not None:
             self._batch_semaphore = asyncio.Semaphore(max_concurrent_batches)
-        self._job_queue: asyncio.Queue[_Job] = asyncio.Queue()
+        self._job_queue: asyncio.Queue[_Job[*Ts, R]] = asyncio.Queue()
         self._on_exception = on_exception
 
-    async def __call__(self, *args: P.args) -> asyncio.Future[R]:
-        job = _Job(args=args, future=asyncio.get_running_loop().create_future())
+    async def __call__(self, *args: typing.Unpack[Ts]) -> asyncio.Future[R]:
+        job: _Job[*Ts, R] = _Job(
+            args=args, future=asyncio.get_running_loop().create_future()
+        )
         await self._job_queue.put(job)
 
         if self._loop_task is None:
@@ -71,7 +72,7 @@ class _AutoBatcher:
                 # No jobs, wait for one
                 return
 
-            jobs = []
+            jobs: list[_Job[*Ts, R]] = []
             first_job = await self._job_queue.get()
             jobs.append(first_job)
             delay = self._start_delay if first else self._max_delay
@@ -79,16 +80,16 @@ class _AutoBatcher:
             await self._fetch_batch(jobs, delay)
             await self._process_batch(jobs)
 
-    async def _process_batch(self, jobs: list[_Job]) -> None:
+    async def _process_batch(self, jobs: list[_Job[*Ts, R]]) -> None:
         if self._batch_semaphore is not None:
             await self._batch_semaphore.acquire()
 
         task = asyncio.create_task(self._execute_batch(jobs))
         task.add_done_callback(self._on_batch_done)
 
-    async def _execute_batch(self, jobs: list[_Job]) -> None:
-        args_list = []
-        futs = []
+    async def _execute_batch(self, jobs: list[_Job[*Ts, R]]) -> None:
+        args_list: list[tuple[typing.Unpack[Ts]]] = []
+        futs: list[asyncio.Future[R]] = []
         for job in jobs:
             if job.future.cancelled():
                 continue
@@ -114,7 +115,7 @@ class _AutoBatcher:
         if exc is not None and self._on_exception is not None:
             self._on_exception(exc)
 
-    async def _fetch_batch(self, jobs: list[_Job], delay: float) -> None:
+    async def _fetch_batch(self, jobs: list[_Job[*Ts, R]], delay: float) -> None:
         begin = jobs[0].created_at
 
         while self._batch_size is None or len(jobs) < self._batch_size:
@@ -133,14 +134,14 @@ class _AutoBatcher:
 
 
 def autobatch(
-    batch_fn: BatchFn,
+    batch_fn: BatchFn[*Ts, R],
     start_delay: float = 0,
     batch_size: int | None = None,
     max_delay: float = 1.0,
     max_concurrent_batches: int | None = None,
     on_exception: typing.Callable[[Exception], None] | None = None,
-) -> Fn:
-    return _AutoBatcher(
+) -> Fn[*Ts, R]:
+    return _AutoBatcher[*Ts, R](
         batch_fn,
         start_delay=start_delay,
         batch_size=batch_size,
