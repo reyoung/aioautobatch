@@ -13,18 +13,16 @@ class Fn(typing.Protocol[*Ts, R]):
     async def __call__(self, *args: typing.Unpack[Ts]) -> asyncio.Future[R]: ...
 
 
-class BatchFn(typing.Protocol[*Ts, R]):
-    @typing.overload
-    async def __call__(
-        self, args_list: list[tuple[typing.Unpack[Ts]]]
-    ) -> list[R]: ...
-
-    @typing.overload
-    async def __call__(
-        self,
-        args_list: list[tuple[typing.Unpack[Ts]]],
-        futures: list[asyncio.Future[R]],
-    ) -> list[R] | None: ...
+BatchFn: typing.TypeAlias = (
+    typing.Callable[
+        [list[tuple[typing.Unpack[Ts]]]],
+        typing.Awaitable[list[R]],
+    ]
+    | typing.Callable[
+        [list[tuple[typing.Unpack[Ts]]], list[asyncio.Future[R]]],
+        typing.Awaitable[list[R] | None],
+    ]
+)
 
 
 @dataclasses.dataclass(frozen=True)
