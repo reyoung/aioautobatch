@@ -1,6 +1,7 @@
 import typing
 import dataclasses
 import asyncio
+import inspect
 
 __all__ = ["autobatch"]
 
@@ -13,9 +14,17 @@ class Fn(typing.Protocol[*Ts, R]):
 
 
 class BatchFn(typing.Protocol[*Ts, R]):
+    @typing.overload
     async def __call__(
         self, args_list: list[tuple[typing.Unpack[Ts]]]
     ) -> list[R]: ...
+
+    @typing.overload
+    async def __call__(
+        self,
+        args_list: list[tuple[typing.Unpack[Ts]]],
+        futures: list[asyncio.Future[R]],
+    ) -> list[R] | None: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,6 +56,7 @@ class _AutoBatcher(typing.Generic[*Ts, R]):
             self._batch_semaphore = asyncio.Semaphore(max_concurrent_batches)
         self._job_queue: asyncio.Queue[_Job[*Ts, R]] = asyncio.Queue()
         self._on_exception = on_exception
+        self._accepts_future_list = _accepts_future_list(batch_fn)
 
     async def __call__(self, *args: typing.Unpack[Ts]) -> asyncio.Future[R]:
         job: _Job[*Ts, R] = _Job(
@@ -96,16 +106,17 @@ class _AutoBatcher(typing.Generic[*Ts, R]):
             args_list.append(job.args)
             futs.append(job.future)
         try:
-            res_list = await self._batch_fn(args_list)
+            if self._accepts_future_list:
+                res_list = await self._batch_fn(args_list, futs)
+            else:
+                res_list = await self._batch_fn(args_list)
         except Exception as e:
             for fut in futs:
-                if not fut.cancelled():
+                if not fut.cancelled() and not fut.done():
                     fut.set_exception(e)
             raise
         else:
-            for fut, res in zip(futs, res_list):
-                if not fut.cancelled():
-                    fut.set_result(res)
+            self._apply_results(futs, res_list)
 
     def _on_batch_done(self, task: asyncio.Task[None]) -> None:
         if self._batch_semaphore is not None:
@@ -136,6 +147,32 @@ class _AutoBatcher(typing.Generic[*Ts, R]):
                 break
 
             jobs.append(job)
+
+    @staticmethod
+    def _apply_results(
+        futs: list[asyncio.Future[R]], results: typing.Iterable[R] | None
+    ) -> None:
+        if results is None:
+            return
+
+        for fut, res in zip(futs, results):
+            if fut.cancelled() or fut.done():
+                continue
+            fut.set_result(res)
+
+
+def _accepts_future_list(batch_fn: typing.Callable[..., typing.Any]) -> bool:
+    try:
+        sig = inspect.signature(batch_fn)
+    except (TypeError, ValueError):
+        return False
+
+    try:
+        sig.bind_partial([], [])
+    except TypeError:
+        return False
+    else:
+        return True
 
 
 def autobatch(

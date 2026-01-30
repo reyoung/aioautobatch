@@ -79,3 +79,37 @@ class AutoBatchTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(len(caught), 1)
         self.assertIsInstance(caught[0], ValueError)
+
+    async def test_batch_fn_with_future_list_allows_early_resolution(self) -> None:
+        completion_order: list[float] = []
+
+        async def batch_fn(
+            args_list: list[tuple[float]], futures: list[asyncio.Future[float]]
+        ) -> None:
+            for (delay,), fut in zip(args_list, futures):
+                async def worker(d: float, f: asyncio.Future[float]) -> None:
+                    await asyncio.sleep(d)
+                    if f.cancelled() or f.done():
+                        return
+                    f.set_result(d)
+                    completion_order.append(d)
+
+                asyncio.create_task(worker(delay, fut))
+
+            # Ensure worker tasks get a chance to start before we return
+            await asyncio.sleep(0)
+
+        fn = autobatch(batch_fn, start_delay=0.01, max_delay=0.01)
+
+        slow = await fn(0.05)
+        fast = await fn(0.01)
+
+        fast_result = await asyncio.wait_for(fast, timeout=0.04)
+        self.assertEqual(fast_result, 0.01)
+        self.assertFalse(slow.done())
+
+        slow_result = await asyncio.wait_for(slow, timeout=0.1)
+        self.assertEqual(slow_result, 0.05)
+
+        self.assertEqual(completion_order[0], 0.01)
+        self.assertEqual(completion_order[-1], 0.05)
