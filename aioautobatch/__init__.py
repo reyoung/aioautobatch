@@ -42,7 +42,7 @@ class _AutoBatcher(typing.Generic[*Ts, R]):
         batch_size: int | None = None,
         max_delay: float = 1.0,
         max_concurrent_batches: int | None = None,
-        on_exception: typing.Callable[[BaseException], None] | None = None,
+        on_exception: typing.Callable[[Exception], None] | None = None,
     ) -> None:
         self._loop_task: None | asyncio.Task[None] = None
         self._batch_fn: BatchFn[*Ts, R] = batch_fn
@@ -128,7 +128,11 @@ class _AutoBatcher(typing.Generic[*Ts, R]):
         
         exc = task.exception()
         if exc is not None and self._on_exception is not None:
-            self._on_exception(exc)
+            if isinstance(exc, Exception):
+                self._on_exception(exc)
+            else:
+                # Fallback: wrap non-Exception BaseException so callbacks typed for Exception still work
+                self._on_exception(Exception(str(exc)))
 
     async def _fetch_batch(self, jobs: list[_Job[*Ts, R]], delay: float) -> None:
         begin = jobs[0].created_at
